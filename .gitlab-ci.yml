@@ -1,0 +1,271 @@
+#  BRSIS Tecnologia web
+#  Author: João A. Zonta
+#  Since: 20/05/2020
+
+image: docker:dind
+
+services:
+  - docker:dind
+
+variables:
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: overlay2 #Por padrão, ao usar docker:dind, o Docker usa o vfsdriver de armazenamento que copia o sistema de arquivos a cada execução. Essa é uma operação que exige muito disco e pode ser evitada se um driver diferente for usado, por exemplo overlay2.
+  FOLDER: /docker/portal2
+  SLACK_URL: https://hooks.slack.com/services/.......
+  CONTENT: 'Content-type: application/json'
+  RELEASES_DIR: /docker/portal2/releases
+
+stages:
+  - build
+  - teste
+  - deploy
+  - docker
+
+npm:
+  stage: build
+  image: gitlab.brsis.com.br:4567/docker/php:7.4-fpm-oci
+  only:
+    - homolog
+    - master
+  script:
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Iniciando npm ..."}'
+    - echo "Iniciando NPM"
+    - rm -rf build
+    - cd www
+    - npm install
+    - npm run build
+    - echo "Copiando pasta public/build para /build"
+    - cp -R public/build ../
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Npm finalizado."}'
+  artifacts:
+    paths:
+      - build
+      - docs
+    expire_in: 1 days
+    when: always
+  cache:
+    paths:
+      - build
+      - docs
+        
+composer:
+  stage: build
+  image: gitlab.brsis.com.br:4567/docker/php:7.4-fpm-oci
+  only:
+    - homolog
+    - master
+  script:
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Iniciando composer ..."}'
+    - echo "Iniciando Composer"
+    - rm -rf vendor
+    #
+    - cp www/env-example www/.env
+    - cp _docker/php.ini /usr/local/etc/php/php.ini
+    - cd www
+    - composer install
+    # 
+    - echo "Copiando pasta vendor"
+    - cp -R vendor ../
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Composer finalizado"}'
+  artifacts:
+    paths:
+      - vendor
+    expire_in: 1 days
+    when: always
+  cache:
+    paths:
+      - vendor
+
+teste-php:
+  stage: teste
+  image: gitlab.brsis.com.br:4567/docker/php:7.4-fpm-oci
+  only:
+    - homolog
+    - master
+  script:
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Iniciando testes e checks ..."}'
+    - echo "Iniciando Testes e Checks"
+    - cp www/env-example www/.env
+    - cp _docker/php.ini /usr/local/etc/php/php.ini
+    - cp -R vendor/ www
+    - cp -R build/ www/public
+    - cd www
+    - wget https://get.symfony.com/cli/installer -O - | bash
+    - mv /root/.symfony/bin/symfony /usr/local/bin/symfony
+    - symfony check:requirements
+    - symfony security:check
+    - php ./bin/phpstan.phar analyse ./src/
+    - php ./bin/php-cs-fixer fix --dry-run --diff --stop-on-violation ../www/src/
+    - php ./bin/phpunit
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Testes e checks finalizados. Os arquivos estão prontos para o deploy."}'
+
+.job-template: &script_template
+  script:
+    - if [ "$ENV" == "env-producao" ]; then
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Iniciando deploy na Produção ..."}'
+    - else
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Iniciando deploy no Homolog ..."}'
+    - fi
+    - export RELEASE=$(date '+%Y%m%d%H%M%s')
+    - export NEW_RELEASE_DIR=${RELEASES_DIR}/${RELEASE};
+    #
+    - echo "Iniciando deploy no servidor ($HOST)"
+    - mkdir -p ~/.ssh
+    - echo "$PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - eval "$(ssh-agent -s)"
+    - ssh-add ~/.ssh/id_rsa
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+    # Envia e roda o before.sh
+    - scp -r before.sh root@"$HOST":$FOLDER
+    - ssh -p22 root@"$HOST" "cd $FOLDER; chmod 755 before.sh; bash before.sh"
+    #
+    - cp -R vendor/ www
+    - cp -R build/ www/public
+    - echo "Copiando pasta wwww para $NEW_RELEASE_DIR"
+    - ssh -p22 root@"$HOST" "mkdir $NEW_RELEASE_DIR"
+    - scp -r www/* root@"$HOST":$NEW_RELEASE_DIR
+    # Configuração do .env do symfony
+    - if [ "$ENV" == "env-homolog" ]; then
+    - ssh -p22 root@"$HOST" "cd $NEW_RELEASE_DIR; cp -f $ENV $FOLDER/.env"
+    - echo "Copiando pasta public/docs"
+    - scp -r docs/ root@"$HOST":$NEW_RELEASE_DIR/public/
+    - fi
+    #
+    #- echo "Criando link para a pasta var"
+    #- ssh -p22 root@"$HOST" "ln -nfs $FOLDER/var $NEW_RELEASE_DIR/var"
+    #- echo "Criando link para .env"
+    #- ssh -p22 root@"$HOST" "ln -nfs $FOLDER/.env $NEW_RELEASE_DIR/.env"
+    - echo "Criando link para release atual"
+    - ssh -p22 root@"$HOST" "ln -nfs $NEW_RELEASE_DIR $FOLDER/current"
+    # reinicia o php-fpm dentro do container
+    - ssh -p22 root@"$HOST" "cd $FOLDER/_docker; docker-compose restart"
+    # Apaga o cache
+    - ssh -p22 root@"$HOST" "docker exec -i www-php-portal2 sh -c 'cd /var/www; php bin/console cache:clear'"
+    - ssh -p22 root@"$HOST" "docker exec -i www-php-portal2 sh -c 'cd /var/www; bin/console doctrine:cache:clear-query'"
+    - ssh -p22 root@"$HOST" "docker exec -i www-php-portal2 sh -c 'cd /var/www; bin/console doctrine:cache:clear-result'"
+    - ssh -p22 root@"$HOST" "docker exec -i www-php-portal2 sh -c 'cd /var/www; bin/console doctrine:cache:clear-metadata'"
+    # Ajusta permissões
+    - echo "Ajustando permissões para $NEW_RELEASE_DIR"
+    - ssh -p22 root@"$HOST" "chmod -R 755 $NEW_RELEASE_DIR"
+    # Envia e roda o after.sh
+    - scp -r after.sh root@"$HOST":$FOLDER
+    - ssh -p22 root@"$HOST" "cd $FOLDER; chmod 755 after.sh; bash after.sh"
+    # reinicia o php-fpm dentro do container
+    - ssh -p22 root@"$HOST" "docker exec -i www-php-portal2 sh -c 'kill -USR2 1'"
+    - if [ "$ENV" == "env-producao" ]; then
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Finalizado deploy na Produção ..."}'
+    - else
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Finalizado no Homolog ..."}'
+    - fi
+
+homolog:
+  stage: deploy
+  image: gitlab.brsis.com.br:4567/docker/php:7.4-fpm-oci
+  environment:
+    name: homolog
+  variables:
+    HOST: "srv-docker4h.brsis.com.br"
+    ENV: "env-homolog"
+  dependencies:
+    - npm
+    - composer
+    - teste-php
+  only:
+    - homolog
+  <<: *script_template
+
+producao:
+  stage: deploy
+  image: gitlab.brsis.com.br:4567/docker/php:7.4-fpm-oci
+  environment:
+    name: producao
+  variables:
+    HOST: "srv-docker4.brsis.com.br"
+    ENV: "env-producao"
+  dependencies:
+    - npm
+    - composer
+    - teste-php
+  only:
+    - master
+  when: manual
+  <<: *script_template
+
+
+.job-template_docker: &script_template_docker
+  script:
+    - apk add --update curl && rm -rf /var/cache/apk/*
+    - if [ "$ENV" == "env-producao" ]; then
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Iniciando atualização Docker na Produção ..."}'
+    - else
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Iniciando atualização Docker no Homolog ..."}'
+    - fi
+    #
+    - echo "Iniciando deploy no servidor ($HOST)"
+    - mkdir -p ~/.ssh
+    - echo "$PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - eval "$(ssh-agent -s)"
+    - ssh-add ~/.ssh/id_rsa
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+    - echo "Parando containers"
+    - ssh -p22 root@"$HOST" 'if [ "$(docker ps -q -f name=www-php-portal2)" ]; then
+      docker stop www-php-portal2;
+      fi'
+    - ssh -p22 root@"$HOST" 'if [ "$(docker ps -q -f name=www-nginx-portal2)" ]; then
+      docker stop www-nginx-portal2;
+      fi'
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Containers parados ..."}'
+    #
+    - echo "Atualizando container"
+    - ssh -p22 root@"$HOST" "docker login -u=$CI_REGISTRY_USER -p=$CI_JOB_TOKEN $CI_REGISTRY"
+    - ssh -p22 root@"$HOST" "docker pull gitlab.brsis.com.br:4567/docker/php:7.4-fpm-oci"
+    #
+    - echo "Copiando pasta _docker"
+    - ssh -p22 root@"$HOST" "cd $FOLDER; rm -rf _docker"
+    - scp -r _docker root@"$HOST":$FOLDER/
+    #
+    - echo "Renomeando arquivo de configuração do docker $ENV para .env"
+    - if [ "$ENV" == "env-producao" ]; then
+    - ssh -p22 root@"$HOST" "cd $FOLDER/_docker; mv env-producao .env"
+    - else
+    - ssh -p22 root@"$HOST" "cd $FOLDER/_docker; mv env-homolog .env"
+    - fi
+    #
+    - echo "Ajustando permissões para _docker"
+    - ssh -p22 root@"$HOST" "cd $FOLDER; chmod -R 755 _docker;"
+    - ssh -p22 root@"$HOST" "cd $FOLDER/_docker; docker-compose up -d"
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Containers iniciados ..."}'
+    - ssh -p22 root@"$HOST" "docker exec -i www-php-portal2 sh -c 'cd /var/www; chown -R www-data var;'"
+    - ssh -p22 root@"$HOST" "docker image prune -a -f"
+    #
+    - if [ "$ENV" == "env-producao" ]; then
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Finalizada atualização Docker na Produção ..."}'
+    - else
+    - curl -X POST "$SLACK_URL" -H "$CONTENT" --data '{"text":"Finalizada atualização Docker no Homolog ..."}'
+    - fi
+
+atualizar-docker-homolog:
+  stage: docker
+  environment:
+    name: homolog
+  variables:
+    HOST: "srv-docker4h.brsis.com.br"
+    ENV: "env-homolog"
+  only:
+    - homolog
+  when: manual
+  <<: *script_template_docker
+
+atualizar-docker-producao:
+  stage: docker
+  environment:
+    name: producao
+  variables:
+    HOST: "srv-docker4.brsis.com.br"
+    ENV: "env-producao"
+  only:
+    - master
+  when: manual
+  <<: *script_template_docker
